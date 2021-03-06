@@ -2,248 +2,193 @@ package main
 
 import (
 	"bufio"
-	"io"
+	"fmt"
+	"io/ioutil"
 	"log"
 	"os"
+	"sync"
+	"time"
 )
 
-/*
-Generate a large file:
-
-dd if=/dev/urandom of=large_file.bin bs=1024 count=512000
-
-go test -bench=.
-*/
-
-/*
-SectionReaderAndLength ...
-*/
-type SectionReaderAndLength struct {
-	sectionReader *io.SectionReader
-	contentLength int64
+type chunk struct {
+	bufsize int
+	offset  int64
 }
 
-func normalRead(fileName string) ([]byte, error) {
-	f, err := os.Open(fileName)
-	if err != nil {
-		return nil, err
-	}
+type BufferData struct {
+	bytes []byte
+}
 
+type ChunkAndBuffer struct {
+	myChunk  chunk
+	myBuffer []byte
+	myIndex  int
+}
+
+type Output struct {
+	myIndex      int
+	myBufferData BufferData
+}
+
+var IndexBufferDataMap map[int]BufferData
+
+func performanceRead(fileName string, writeAfterRead bool) {
+	start := time.Now()
+
+	const BufferSize = 314572800
+	file, err := os.Open(fileName)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
 	defer func() {
-		_ = f.Close()
+		_ = file.Close()
 	}()
 
-	reader := bufio.NewReader(f)
-	buf := make([]byte, 256)
+	fileinfo, err := file.Stat()
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
 
-	returnData := make([]byte, int64(0))
+	filesize := int(fileinfo.Size())
 
-	for {
-		_, err := reader.Read(buf)
+	log.Printf("fileName : %v", fileName)
+	log.Printf("filesize : %v", filesize)
+
+	// Number of go routines we need to spawn.
+	concurrency := filesize / BufferSize
+	// buffer sizes that each of the go routine below should use. ReadAt
+	// returns an error if the buffer size is larger than the bytes returned
+	// from the file.
+	chunksizes := make([]chunk, concurrency)
+
+	// All buffer sizes are the same in the normal case. Offsets depend on the
+	// index. Second go routine should start at 100, for example, given our
+	// buffer size of 100.
+	for i := 0; i < concurrency; i++ {
+		chunksizes[i].bufsize = BufferSize
+		chunksizes[i].offset = int64(BufferSize * i)
+	}
+
+	// check for any left over bytes. Add the residual number of bytes as the
+	// the last chunk size.
+	if remainder := filesize % BufferSize; remainder != 0 {
+		c := chunk{bufsize: remainder, offset: int64(concurrency * BufferSize)}
+		concurrency++
+		chunksizes = append(chunksizes, c)
+	}
+
+	var wg sync.WaitGroup
+
+	arrayOfChunkAndBuffer := make([]ChunkAndBuffer, 0)
+
+	chunkAndBufferChannel := make(chan ChunkAndBuffer)
+
+	outputChannel := make(chan Output)
+
+	IndexBufferDataMap = make(map[int]BufferData)
+
+	for i := 0; i < concurrency; i++ {
+		chunk := chunksizes[i]
+		buffer := make([]byte, chunk.bufsize)
+		chunkAndBuffer := ChunkAndBuffer{myBuffer: buffer, myChunk: chunk, myIndex: i}
+		arrayOfChunkAndBuffer = append(arrayOfChunkAndBuffer, chunkAndBuffer)
+	}
+
+	wg.Add(concurrency)
+	for i := 0; i < concurrency; i++ {
+		go func(i int, wg *sync.WaitGroup) {
+			defer wg.Done()
+			chunkAndBufferChannel <- arrayOfChunkAndBuffer[i]
+		}(i, &wg)
+	}
+
+	wg.Add(concurrency)
+	for i := 0; i < concurrency; i++ {
+		go func(i int, wg *sync.WaitGroup) {
+			defer wg.Done()
+
+			myChunkAndBuffer := <-chunkAndBufferChannel
+			chunk := myChunkAndBuffer.myChunk
+			buffer := myChunkAndBuffer.myBuffer
+			index := myChunkAndBuffer.myIndex
+			//bytesread, err := file.ReadAt(buffer, chunk.offset)
+			_, err := file.ReadAt(buffer, chunk.offset)
+			if err != nil {
+				log.Printf("ERROR : %v", err.Error())
+				return
+			}
+			bufferData := BufferData{
+				bytes: buffer,
+			}
+			myOutputData := Output{
+				myIndex:      index,
+				myBufferData: bufferData,
+			}
+			outputChannel <- myOutputData
+		}(i, &wg)
+	}
+
+	//wg.Add(1)
+	go func() {
+		//defer wg.Done()
+		for {
+			outputData, ok := <-outputChannel
+			if !ok {
+				return
+			}
+			index := outputData.myIndex
+			bufferData := outputData.myBufferData
+			IndexBufferDataMap[index] = bufferData
+		}
+	}()
+
+	wg.Wait()
+
+	if !writeAfterRead {
+		return
+	} else {
+		outputFile, _ := os.OpenFile("output_file_1", os.O_CREATE|os.O_WRONLY, 0644)
+		datawriter := bufio.NewWriter(outputFile)
+
+		for i := 0; i < concurrency; i++ {
+			bufferData := IndexBufferDataMap[i]
+			dataBytes := bufferData.bytes
+			_, _ = datawriter.Write(dataBytes)
+		}
+
+		_ = datawriter.Flush()
+	}
+
+	duration := time.Since(start)
+
+	log.Printf("time for performance read and write : %v", duration)
+
+}
+
+func normalRead(fileName string, writeAfterRead bool) {
+	start := time.Now()
+	data, err := ioutil.ReadFile(fileName)
+	if err != nil {
+		log.Printf("ERROR : could not read file : %v", err.Error())
+	}
+
+	if !writeAfterRead {
+		return
+	} else {
+		err = ioutil.WriteFile("output_file_2", data, 0644)
 		if err != nil {
-			if err != io.EOF {
-				return nil, err
-			}
-			break
+			// print it out
+			log.Printf("ERROR : could not write file : %v", err.Error())
 		}
-		for _, byteData := range buf {
-			returnData = append(returnData, byteData)
-		}
-		//fmt.Printf("%s", hex.Dump(buf))
-	}
-	return returnData, nil
-}
-
-func performanceRead(fileName string) ([]byte, error) {
-
-	f, _ := os.Open(fileName)
-	defer func() {
-		_ = f.Close()
-	}()
-
-	fi, err := os.Stat(fileName)
-	if err != nil {
-		log.Printf("ERROR : could not stat file : %v", err.Error())
-		return nil, err
-	}
-	// get the size
-	fileSize := fi.Size()
-
-	var i int64
-
-	offsetAndLengthList := make([]map[string]int64, 0)
-
-	arrryOfNewSectionReaders := make([]SectionReaderAndLength, int64(0))
-	chunkLength := int64(20971520) // bytes
-
-	numberOfParts := fileSize / chunkLength
-
-	lastChunkLength := fileSize % (chunkLength)
-
-	for i = 0; i < numberOfParts; i++ {
-		myMap := make(map[string]int64)
-		myMap["offset"] = i * chunkLength
-		myMap["chunkLength"] = chunkLength
-		offsetAndLengthList = append(offsetAndLengthList, myMap)
 	}
 
-	if lastChunkLength != 0 {
-		myMap := make(map[string]int64)
-		offset := (numberOfParts) * chunkLength
-		myMap["offset"] = offset
-		myMap["chunkLength"] = lastChunkLength
-		offsetAndLengthList = append(offsetAndLengthList, myMap)
-	}
-
-	for _, offsetAndLength := range offsetAndLengthList {
-		offset := offsetAndLength["offset"]
-		chunkLength := offsetAndLength["chunkLength"]
-		s := io.NewSectionReader(f, offset, chunkLength)
-		sectionReaderAndLength := SectionReaderAndLength{
-			sectionReader: s,
-			contentLength: chunkLength,
-		}
-		arrryOfNewSectionReaders = append(arrryOfNewSectionReaders, sectionReaderAndLength)
-	}
-
-	wait := make(chan bool, 1)
-	readBytesChannel := make(chan []byte)
-
-	go func() {
-		for _, sectionReader := range arrryOfNewSectionReaders {
-			contentLength := sectionReader.contentLength
-			secReader := sectionReader.sectionReader
-			buf := make([]byte, contentLength)
-			_, err := secReader.Read(buf)
-			if err == io.EOF {
-				break
-			} else if err != nil {
-				break
-			}
-			readBytesChannel <- buf
-		}
-	}()
-
-	returnData := make([]byte, int64(0))
-
-	var j int64
-	go func() {
-		for j = 0; j < int64(len(arrryOfNewSectionReaders)); j++ {
-			data := <-readBytesChannel
-			for _, byteData := range data {
-				returnData = append(returnData, byteData)
-			}
-		}
-		close(wait)
-	}()
-
-	<-wait
-
-	return returnData, nil
+	duration := time.Since(start)
+	log.Printf("time for normal read and write : %v", duration)
 
 }
-
 func main() {
-
-	fileName := "random2.bin"
-
-	//log.Printf("file to read (%v)", fileName)
-	//
-	//var counter int64
-	//
-	//f, _ := os.Open(fileName)
-	//defer func() {
-	//	_ = f.Close()
-	//}()
-	//
-	//fi, err := os.Stat(fileName)
-	//if err != nil {
-	//	log.Printf("ERROR : could not stat file : %v", err.Error())
-	//	return
-	//}
-	//// get the size
-	//fileSize := fi.Size()
-	//
-	//log.Printf("fileSize : %v", fileSize)
-	//
-	//var i int64
-	//
-	//offsetAndLengthList := make([]map[string]int64, 0)
-	//arrryOfNewSectionReaders := make([]SectionReaderAndLength, 0)
-	//chunkLength := int64(300) // bytes
-	//
-	//numberOfParts := fileSize / chunkLength
-	//
-	//lastChunkLength := fileSize % (chunkLength)
-	//
-	//log.Printf("numberOfParts : %v", numberOfParts)
-	//
-	//log.Printf("lastChunkLength : %v", lastChunkLength)
-	//
-	//for i = 0; i < numberOfParts; i++ {
-	//	myMap := make(map[string]int64)
-	//	myMap["offset"] = i * chunkLength
-	//	myMap["chunkLength"] = chunkLength
-	//	offsetAndLengthList = append(offsetAndLengthList, myMap)
-	//}
-	//
-	//if lastChunkLength != 0 {
-	//	myMap := make(map[string]int64)
-	//	offset := (numberOfParts) * chunkLength
-	//	myMap["offset"] = offset
-	//	myMap["chunkLength"] = lastChunkLength
-	//	offsetAndLengthList = append(offsetAndLengthList, myMap)
-	//}
-	//
-	//log.Printf("offsetAndLengthList : %v", offsetAndLengthList)
-	//
-	//for _, offsetAndLength := range offsetAndLengthList {
-	//	offset := offsetAndLength["offset"]
-	//	chunkLength := offsetAndLength["chunkLength"]
-	//	s := io.NewSectionReader(f, offset, chunkLength)
-	//	sectionReaderAndLength := SectionReaderAndLength{
-	//		sectionReader: s,
-	//		contentLength: chunkLength,
-	//	}
-	//	arrryOfNewSectionReaders = append(arrryOfNewSectionReaders, sectionReaderAndLength)
-	//}
-	//
-	//log.Printf("len(arrryOfNewSectionReaders): %v", len(arrryOfNewSectionReaders))
-	//
-	//allBytesRead := make([]byte, 0)
-	//
-	//counter = 0
-	//for _, sectionReader := range arrryOfNewSectionReaders {
-	//	contentLength := sectionReader.contentLength
-	//	secReader := sectionReader.sectionReader
-	//	buf := make([]byte, contentLength)
-	//	n, err := secReader.Read(buf)
-	//	if err == io.EOF {
-	//		log.Printf("reached the end")
-	//		break
-	//	} else if err != nil {
-	//		log.Printf("ERROR : could not read onto buffer : %v", err.Error())
-	//		break
-	//	}
-	//
-	//	log.Printf("### of bytes read : %v", n)
-	//
-	//	for _, data := range buf {
-	//		allBytesRead = append(allBytesRead, data)
-	//	}
-	//	log.Printf("counter (%v) : n => %v", counter, n)
-	//	counter++
-	//}
-	//
-	////s := io.NewSectionReader(f, 5, chunkLength)
-
-	allBytesRead, _ := performanceRead(fileName)
-
-	log.Printf("allBytesRead : %v", len(allBytesRead))
-
-	outFile := "output"
-	writeFileHandle, _ := os.Create(outFile)
-	bytesWritten, _ := writeFileHandle.Write(allBytesRead)
-	log.Printf("wrote %d bytes , to file (%v)", bytesWritten, outFile)
-
+	performanceRead("large_file.bin", false)
+	normalRead("large_file.bin", false)
 }

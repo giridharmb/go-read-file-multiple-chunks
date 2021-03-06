@@ -4,12 +4,12 @@ import "testing"
 
 func BenchmarkPerformanceRead(b *testing.B) {
 	for n := 0; n < b.N; n++ {
-		_, _ = performanceRead("large_file.bin")
+		performanceRead("large_file.bin", true)
 	}
 }
 
 func BenchmarkNormaleRead(b *testing.B) {
 	for n := 0; n < b.N; n++ {
-		_, _ = normalRead("large_file.bin")
+		normalRead("large_file.bin", true)
 	}
 }
